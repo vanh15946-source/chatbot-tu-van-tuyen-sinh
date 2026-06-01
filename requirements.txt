@@ -1,0 +1,7 @@
+streamlit
+python-dotenv
+langchain-chroma
+langchain-huggingface
+langchain-neo4j
+langchain-groq
+sentence-transformers
