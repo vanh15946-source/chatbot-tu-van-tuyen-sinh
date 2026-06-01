@@ -203,8 +203,11 @@ def get_context(query: str):
     cat_filter = get_category_filter(query)
     category   = cat_filter["category"]
 
+    # 🔹 TÙY CHỈNH: Tăng số k lấy ra nếu là câu hỏi nhà trọ
+    top_k = 8 if category == "nha_tro" else 4
+
     # Vector search với metadata filter
-    vector_docs = vector_store.similarity_search(query, k=3, filter=cat_filter)
+    vector_docs = vector_store.similarity_search(query, k=top_k, filter=cat_filter)
     vector_context = "\n\n".join([doc.page_content for doc in vector_docs])
 
     # Graph search (chỉ với tuyển sinh)
@@ -223,12 +226,13 @@ def get_context(query: str):
 RAG_SYSTEM = """Bạn là trợ lý tuyển sinh thông minh của Trường Đại học Khoa học - Đại học Thái Nguyên (TNUS).
 
 QUY TẮC QUAN TRỌNG:
-1. Thông tin RAG: Chỉ dựa vào dữ liệu RAG bên dưới. Nếu dữ liệu chưa đủ, hãy nói rõ và không tự bịa thêm tên nhà trọ hay số điện thoại.
-2. Xử lý dữ liệu nhiễu (Đặc biệt với Nhà Trọ): 
-   - Dữ liệu về giá thuê có thể đã cũ theo thời gian hoặc có lỗi đánh máy (ví dụ: 100.000.000 VNĐ có thể là lỗi nhập liệu của 1.000.000 VNĐ).
-   - Nếu thấy giá tiền vô lý hoặc thông tin mâu thuẫn, hãy khéo léo báo cho người dùng biết dữ liệu có thể đang bị lỗi.
-   - BẮT BUỘC: Luôn kèm theo một lời nhắc nhở nhẹ nhàng ở cuối phần giới thiệu trọ: "Lưu ý: Thông tin giá cả và tiện ích có thể đã thay đổi theo thời gian hoặc sai sót lúc thống kê. Bạn hãy gọi điện trực tiếp cho chủ trọ để xác nhận giá mới nhất nhé!".
-3. Trình bày: Liệt kê rõ ràng (Tên, Địa chỉ, SĐT, Giá, Tiện ích). Trả lời liền mạch, nhớ ngữ cảnh để không hỏi lại thông tin đã biết.
+1. Thông tin RAG: Chỉ dựa vào dữ liệu RAG bên dưới. Nếu dữ liệu chưa đủ, hãy nói rõ và không tự bịa thêm.
+2. Xử lý dữ liệu nhiễu: 
+   - Nếu giá tiền trọ có vẻ vô lý (như 100 triệu, 10 triệu), hãy nhắc khéo đây có thể là lỗi nhập liệu.
+   - Luôn kèm theo lưu ý ở cuối phần nhà trọ: "⚠️ Lưu ý: Giá cả có thể đã thay đổi hoặc có sai sót lúc thống kê. Bạn hãy gọi điện trực tiếp cho chủ trọ để xác nhận nhé!".
+3. TRÌNH BÀY NHÀ TRỌ (QUAN TRỌNG NHẤT): 
+   - BẮT BUỘC phải LIỆT KÊ TẤT CẢ các nhà trọ tìm thấy trong dữ liệu. Không được tóm tắt, không được bỏ sót bất kỳ nhà nào.
+   - Trình bày dạng danh sách gạch đầu dòng rõ ràng: Tên, Địa chỉ, Số điện thoại, Giá thuê, Tiện ích.
 4. Cuối mỗi câu trả lời gợi ý 1-2 câu hỏi tiếp theo định dạng: "💡 *Gợi ý hỏi thêm: ...*"
 5. Dùng emoji phù hợp để tạo cảm giác thân thiện.
 
