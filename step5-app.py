@@ -369,8 +369,9 @@ if st.session_state.get("show_summary"):
     else:
         st.info("Hội thoại chưa đủ để tóm tắt.")
 
+
 # ─────────────────────────────────────────────
-# 8. XỬ LÝ ĐẦU VÀO
+# 8. XỬ LÝ ĐẦU VÀO (ĐÃ ĐƯỢC NÂNG CẤP STREAMING)
 # ─────────────────────────────────────────────
 if "pending_input" in st.session_state:
     user_query = st.session_state.pop("pending_input")
@@ -397,53 +398,56 @@ if user_query:
     )
 
     with st.chat_message("assistant"):
+        # ── Bước 1: Định tuyến nhanh bằng spinner ──
         with st.spinner("Đang xử lý..."):
-
-            # ── Định tuyến tự động ──
             route = classify_query(user_query, history_summary_short)
-
             vec_ctx, graph_ctx, category = "", "", "tuyen_sinh"
 
-            # ── Gọi chain phù hợp ──
+            # Nếu là RAG thì bốc dữ liệu trước khi stream
             if route == "RAG":
                 vec_ctx, graph_ctx, category = get_context(user_query)
-                response = rag_chain.invoke({
-                    "vector_context": vec_ctx,
-                    "graph_context":  graph_ctx,
-                    "chat_history":   history_for_llm,
-                    "question":       user_query,
-                })
-            elif route == "CHAT":
-                response = chat_chain.invoke({
-                    "chat_history": history_for_llm,
-                    "question":     user_query,
-                })
-            else:  # GENERAL
-                response = general_chain.invoke({
-                    "chat_history": history_for_llm,
-                    "question":     user_query,
-                })
 
-            # ── Hiển thị ──
-            ROUTE_LABEL = {
-                "RAG":     "📚 Dữ liệu cục bộ",
-                "CHAT":    "💬 Hội thoại thông thường",
-                "GENERAL": "🌐 Kiến thức nền",
-            }
-            if route != "CHAT":
-                st.caption(f"*Nguồn: {ROUTE_LABEL[route]}*")
+        # ── Bước 2: Hiển thị nguồn dữ liệu trước khi chữ chạy ──
+        ROUTE_LABEL = {
+            "RAG": "📚 Dữ liệu cục bộ",
+            "CHAT": "💬 Hội thoại thông thường",
+            "GENERAL": "🌐 Kiến thức nền",
+        }
+        if route != "CHAT":
+            st.caption(f"*Nguồn: {ROUTE_LABEL[route]}*")
 
-            st.markdown(response)
+        # ── Bước 3: Tạo luồng Stream (Generator) ──
+        if route == "RAG":
+            response_stream = rag_chain.stream({
+                "vector_context": vec_ctx,
+                "graph_context": graph_ctx,
+                "chat_history": history_for_llm,
+                "question": user_query,
+            })
+        elif route == "CHAT":
+            response_stream = chat_chain.stream({
+                "chat_history": history_for_llm,
+                "question": user_query,
+            })
+        else:  # GENERAL
+            response_stream = general_chain.stream({
+                "chat_history": history_for_llm,
+                "question": user_query,
+            })
 
-            # Debug expander
-            if route == "RAG":
-                with st.expander("🛠️ Debug — Dữ liệu RAG đã trích xuất"):
-                    st.markdown(f"**Category:** `{category}`")
-                    st.markdown("**📄 Vector DB:**")
-                    st.info(vec_ctx[:500] + "..." if len(vec_ctx) > 500 else vec_ctx or "Không có.")
-                    st.markdown("**🕸️ Graph DB:**")
-                    st.success(graph_ctx or "Không có dữ liệu đồ thị.")
+        # ── Bước 4: Đổ luồng dữ liệu ra giao diện (Chữ chạy từ từ) ──
+        response = st.write_stream(response_stream)
 
+        # ── Bước 5: Hiện bảng Debug bên dưới (nếu có) ──
+        if route == "RAG":
+            with st.expander("🛠️ Debug — Dữ liệu RAG đã trích xuất"):
+                st.markdown(f"**Category:** `{category}`")
+                st.markdown("**📄 Vector DB:**")
+                st.info(vec_ctx[:500] + "..." if len(vec_ctx) > 500 else vec_ctx or "Không có.")
+                st.markdown("**🕸️ Graph DB:**")
+                st.success(graph_ctx or "Không có dữ liệu đồ thị.")
+
+    # Lưu phản hồi cuối cùng vào lịch sử chat
     st.session_state.messages.append({
         "role": "assistant",
         "content": response,
