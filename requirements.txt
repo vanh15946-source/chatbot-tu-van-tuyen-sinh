@@ -5,7 +5,3 @@ langchain-huggingface
 langchain-neo4j
 langchain-groq
 sentence-transformers
-protobuf<=3.20.3
-torch
-torchvision
-langchain-google-genai
