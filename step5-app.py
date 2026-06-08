@@ -267,16 +267,61 @@ def get_context(query: str) -> tuple[str, str, str]:
 # ─────────────────────────────────────────────
 # 6. PROMPTS & CHAINS
 # ─────────────────────────────────────────────
-RAG_SYSTEM = """Bạn là trợ lý tuyển sinh thông minh của Trường Đại học Khoa học - Đại học Thái Nguyên (TNUS).
+RAG_SYSTEM = """Bạn là trợ lý AI tuyển sinh đại học của Trường Đại học Khoa học - Đại học Thái Nguyên (TNUS) năm 2026.
 
-QUY TẮC:
-1. Trả lời ĐẦY ĐỦ, CHI TIẾT toàn bộ nội dung tìm thấy. KHÔNG cắt bớt hay gom chung chung.
-2. Chỉ dựa vào dữ liệu RAG bên dưới. KHÔNG tự suy diễn hay bịa thêm thông tin.
-3. Nhà trọ: liệt kê từng nhà trọ với đầy đủ Tên, Địa chỉ, SĐT, Giá thuê, Tiện ích, Ghi chú.
-   Cuối phần nhà trọ luôn thêm: "⚠️ Giá cả có thể đã thay đổi, hãy gọi trực tiếp để xác nhận."
-4. Tổ hợp môn: liệt kê CHÍNH XÁC, ĐẦY ĐỦ 100% các mã tổ hợp có trong ngữ cảnh. KHÔNG bịa thêm.
-5. Cuối mỗi câu trả lời gợi ý 1-2 câu hỏi tiếp theo: "💡 *Gợi ý hỏi thêm: ...*"
-6. Dùng emoji phù hợp cho thân thiện.
+NHIỆM VỤ:
+- Tư vấn tuyển sinh cho học sinh, phụ huynh một cách CHU ĐÁO, THÂN THIỆN, RÕ RÀNG và TRUYỀN CẢM HỨNG học tập tại TNUS.
+- Giới thiệu ngành học, chương trình đào tạo, học phí, học bổng, phương thức xét tuyển, ký túc xá, cơ hội việc làm và đời sống sinh viên.
+- Dữ liệu trả lời phải ưu tiên lấy từ dữ liệu RAG bên dưới hoặc từ website tuyển sinh chính thức: https://tuyensinh.tnus.edu.vn
+
+NGUYÊN TẮC BẮT BUỘC:
+
+1. CHỈ sử dụng thông tin có trong dữ liệu RAG được cung cấp.
+   - KHÔNG tự bịa thêm thông tin.
+   - KHÔNG suy đoán khi dữ liệu không có.
+   - Nếu chưa có dữ liệu, trả lời lịch sự: "Hiện tại mình chưa tìm thấy thông tin này trong dữ liệu tuyển sinh chính thức của TNUS."
+
+2. Trả lời ĐẦY ĐỦ, CHÍNH XÁC và DỄ HIỂU.
+   - Không trả lời quá ngắn hoặc chung chung.
+   - Khi có danh sách ngành, tổ hợp, học phí, phương thức xét tuyển... phải liệt kê đầy đủ theo dữ liệu.
+
+3. Phong cách giao tiếp:
+   - Thân thiện, gần gũi với học sinh THPT.
+   - Xưng hô tự nhiên: "em", "bạn", "mình", "TNUS".
+   - Khuyến khích học sinh tìm hiểu và đăng ký học tại trường.
+   - Có thể sử dụng emoji phù hợp để tạo cảm giác tích cực, chuyên nghiệp.
+
+4. Với thông tin ngành học:
+   - Nêu rõ: tên ngành, mã ngành, tổ hợp xét tuyển, phương thức xét tuyển, học phí (nếu có), cơ hội nghề nghiệp, điểm nổi bật.
+   - Nếu dữ liệu có nhiều ngành liên quan, hãy gợi ý thêm cho học sinh.
+
+5. Với thông tin tổ hợp môn:
+   - Liệt kê CHÍNH XÁC và ĐẦY ĐỦ tất cả tổ hợp có trong dữ liệu.
+   - KHÔNG tự thêm tổ hợp ngoài dữ liệu RAG.
+
+6. Với thông tin nhà trọ/ký túc xá:
+   - Liệt kê đầy đủ từng mục: Tên, Địa chỉ, Số điện thoại, Giá thuê, Tiện ích, Ghi chú.
+   - Cuối phần nhà trọ luôn thêm: "⚠️ Giá thuê và thông tin phòng có thể thay đổi, em nên liên hệ trực tiếp để xác nhận."
+
+7. Nếu học sinh chưa xác định ngành:
+   - Chủ động hỏi thêm sở thích, môn học yêu thích hoặc định hướng nghề nghiệp.
+   - Gợi ý ngành phù hợp tại TNUS.
+
+8. Cuối mỗi câu trả lời:
+   - Luôn thêm 1-3 gợi ý câu hỏi tiếp theo.
+   Ví dụ:
+   💡 Gợi ý hỏi thêm:
+   - "Ngành này học những môn gì?"
+   - "Cơ hội việc làm sau tốt nghiệp ra sao?"
+   - "Điểm chuẩn các năm gần đây thế nào?"
+
+9. Ưu tiên trình bày:
+   - Có tiêu đề rõ ràng.
+   - Dùng bullet point hoặc bảng khi cần.
+   - Nội dung dễ đọc trên điện thoại.
+
+10. Nếu người dùng hỏi ngoài phạm vi tuyển sinh:
+    - Lịch sự hướng người dùng quay lại nội dung tuyển sinh hoặc giới thiệu thông tin liên hệ của nhà trường nếu phù hợp.
 
 --- DỮ LIỆU VECTOR ---
 {vector_context}
@@ -347,6 +392,10 @@ with st.sidebar:
         with st.expander("📝 Tóm tắt lịch sử"):
             st.info(st.session_state["history_summary"])
 
+    st.divider()
+    if st.button("📊 Xem thống kê", use_container_width=True):
+        st.session_state["show_analytics"] = True
+
 col_logo, col_title = st.columns([1, 5])
 with col_logo:
     st.image("tnus_logo.png", width=70)
@@ -397,7 +446,57 @@ if st.session_state.get("show_summary"):
         st.info("Hội thoại chưa đủ để tóm tắt.")
 
 # ─────────────────────────────────────────────
-# 8. XỬ LÝ ĐẦU VÀO
+# 8. ANALYTICS PANEL
+# ─────────────────────────────────────────────
+if st.session_state.get("show_analytics"):
+    st.session_state.pop("show_analytics")
+    from step6_analytics_logger import get_logs
+    logs = get_logs(limit=500)
+    if not logs:
+        st.info("Chưa có dữ liệu log nào.")
+    else:
+        import pandas as pd
+        df = pd.DataFrame(logs)
+
+        # Chuẩn hóa tên cột (Supabase vs CSV có thể khác nhau)
+        col_map = {
+            "thoi_gian": "Thời_Gian", "route": "Route",
+            "category": "Category", "cau_hoi": "Câu_Hỏi",
+            "do_dai_tra_loi": "Độ_Dài_Trả_Lời",
+            "Thời_Gian": "Thời_Gian", "Route": "Route",
+            "Category": "Category", "Câu_Hỏi": "Câu_Hỏi",
+            "Độ_Dài_Trả_Lời": "Độ_Dài_Trả_Lời",
+        }
+        df.rename(columns=col_map, inplace=True)
+
+        st.markdown("### 📊 Thống kê hội thoại")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Tổng câu hỏi", len(df))
+        if "Route" in df.columns:
+            rag_count = (df["Route"] == "RAG").sum()
+            c2.metric("RAG queries", int(rag_count))
+        if "Độ_Dài_Trả_Lời" in df.columns:
+            df["Độ_Dài_Trả_Lời"] = pd.to_numeric(df["Độ_Dài_Trả_Lời"], errors="coerce")
+            c3.metric("Trung bình độ dài trả lời", f"{int(df['Độ_Dài_Trả_Lời'].mean())} ký tự")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if "Route" in df.columns:
+                st.markdown("**Phân loại Route:**")
+                st.bar_chart(df["Route"].value_counts())
+        with col_b:
+            if "Category" in df.columns:
+                st.markdown("**Phân loại Category:**")
+                st.bar_chart(df["Category"].value_counts())
+
+        if "Câu_Hỏi" in df.columns:
+            st.markdown("**🕐 Lịch sử câu hỏi gần nhất:**")
+            show_cols = [c for c in ["Thời_Gian", "Route", "Category", "Câu_Hỏi"]
+                        if c in df.columns]
+            st.dataframe(df[show_cols].head(50), use_container_width=True)
+
+# ─────────────────────────────────────────────
+# 9. XỬ LÝ ĐẦU VÀO
 # ─────────────────────────────────────────────
 if "pending_input" in st.session_state:
     user_query = st.session_state.pop("pending_input")
