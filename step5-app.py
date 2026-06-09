@@ -1,5 +1,5 @@
 import os
-import asyncio
+import re
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
@@ -9,26 +9,34 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
-from step6_analytics_logger import init_logger, log_interaction
+
+try:
+    from step6_analytics_logger import init_logger, log_interaction, get_logs
+    _HAS_LOGGER = True
+except ImportError:
+    _HAS_LOGGER = False
+    def log_interaction(*a, **kw): pass
+    def get_logs(*a, **kw): return []
 
 load_dotenv()
-init_logger()
+if _HAS_LOGGER:
+    init_logger()
 
 
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
 # 1. KHỞI TẠO HỆ THỐNG
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
 @st.cache_resource
 def init_system():
     embeddings = HuggingFaceEmbeddings(
         model_name="BAAI/bge-m3",
         model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True}
+        encode_kwargs={"normalize_embeddings": True},
     )
     vector_store = Chroma(
         persist_directory="./chroma_db",
         embedding_function=embeddings,
-        collection_name="tnus_tuyen_sinh"
+        collection_name="tnus_tuyen_sinh",
     )
     graph = Neo4jGraph(
         url=os.getenv("NEO4J_URI"),
@@ -38,7 +46,7 @@ def init_system():
     llm = ChatGroq(
         temperature=0.1,
         model_name="llama-3.3-70b-versatile",
-        max_tokens=4096,
+        max_tokens=2048,
         api_key=os.getenv("GROQ_API_KEY"),
     )
     return vector_store, graph, llm
@@ -46,81 +54,431 @@ def init_system():
 
 vector_store, graph, llm = init_system()
 
-# ─────────────────────────────────────────────
-# 2. METADATA FILTER & KEYWORDS (FIX CỨNG PHẠM VI)
-# ─────────────────────────────────────────────
-# FIX 1: Loại bỏ hoàn toàn ký tự đơn "p" để tránh bắt nhầm các từ như "phương thức", "học phí"
-NHA_TRO_KEYWORDS = [
-    "trọ", "thuê", "phòng", "phg", "ở ghép", "xóm", "ký túc", "ktx",
-    "điều hòa", "nóng lạnh", "wifi", "giữ xe", "tiện ích", "khép kín",
-    "điện nước", "đặt cọc", "nhà trọ", "phòng trọ", "thuê phòng", "ở trọ",
-    "giá thuê", "phòng cho thuê", "tìm trọ", "tìm phòng", "gần trường",
-    "z115", "phú thái", "tân thịnh", "quyết thắng", "phan đình phùng"
+
+# ══════════════════════════════════════════════════════════════
+# 2. PHÂN LOẠI CATEGORY — nhà trọ vs tuyển sinh
+# Nguyên tắc: tuyển sinh OVERRIDE trước, rồi mới check nhà trọ
+# BUG CŨ: "p" đơn trong NHA_TRO_KEYWORDS khiến mọi câu có chữ "p" → nhà trọ
+# ══════════════════════════════════════════════════════════════
+
+# Từ khóa tuyển sinh mạnh — nếu có → luôn là tuyen_sinh, không check nhà trọ
+_TUYEN_SINH_STRONG = {
+    "ngành", "điểm chuẩn", "tổ hợp", "xét tuyển", "chỉ tiêu", "học phí",
+    "học bổng", "hồ sơ", "nhập học", "thủ tục", "khoa", "viện", "tnus",
+    "đại học", "phương thức", "chương trình", "đào tạo", "tuyển sinh",
+    "a00", "a01", "a02", "b00", "b08", "c00", "d01", "d07",
+}
+
+# Từ khóa nhà trọ — chỉ dùng cụm từ rõ ràng, KHÔNG dùng ký tự đơn
+_NHA_TRO_STRONG = {
+    "nhà trọ", "phòng trọ", "thuê phòng", "ở trọ", "chỗ ở", "phòng cho thuê",
+    "tìm trọ", "tìm phòng", "ở ghép", "xóm trọ", "nhà thuê", "phòng thuê",
+    "giá thuê", "tiền thuê", "tiền cọc", "đặt cọc", "chủ trọ",
+    "điều hòa", "nóng lạnh", "giữ xe", "khép kín", "điện nước",
+    "ktx", "ký túc xá",
+    "z115", "phú thái", "tân thịnh", "quyết thắng", "sơn tiến",
+    "nước hai", "phan đình phùng",
+}
+
+
+def get_category(query: str, prev_category: str | None = None) -> str:
+    q = query.lower()
+    # Tuyển sinh override tuyệt đối
+    if any(kw in q for kw in _TUYEN_SINH_STRONG):
+        return "tuyen_sinh"
+    # Nhà trọ chỉ khi có tín hiệu rõ ràng
+    if any(kw in q for kw in _NHA_TRO_STRONG):
+        return "nha_tro"
+    # Giữ ngữ cảnh câu trước
+    if prev_category in ("nha_tro", "tuyen_sinh"):
+        return prev_category
+    return "tuyen_sinh"
+
+
+# ══════════════════════════════════════════════════════════════
+# 3. INTENT DETECTION — trong tuyển sinh
+# ══════════════════════════════════════════════════════════════
+
+_TO_HOP_PATTERN = re.compile(r'\b([A-Da-d]\d{2})\b')
+_MA_NGANH_PATTERN = re.compile(r'\b(7\d{6})\b')
+
+# Tên 40 ngành chính xác từ file tất_cả_ngành_học.md
+NGANH_LIST = [
+    "trung quốc học", "hàn quốc học", "việt nam học",
+    "ngôn ngữ trung quốc", "ngôn ngữ anh",
+    "song ngữ anh - trung", "song ngữ anh - hàn",
+    "song ngữ anh trung", "song ngữ anh hàn",
+    "khoa học quản lý", "khoa học quản lí", "quản lý kinh tế", "quản lí kinh tế",
+    "báo chí", "quan hệ công chúng",
+    "luật", "luật kinh tế",
+    "du lịch", "quản trị dịch vụ du lịch và lữ hành", "quản trị du lịch",
+    "quản lý thể dục thể thao", "quản lí thể dục thể thao",
+    "thư viện - thiết bị trường học", "thông tin thư viện",
+    "ngôn ngữ và văn hóa các dân tộc thiểu số việt nam", "dân tộc thiểu số",
+    "công tác xã hội",
+    "quản lý tài nguyên và môi trường", "quản lí tài nguyên và môi trường",
+    "khoa học môi trường",
+    "công nghệ sinh học", "hóa dược", "chăm sóc sắc đẹp từ dược liệu",
+    "công nghệ kỹ thuật hóa học", "công nghệ kĩ thuật hóa học",
+    "công nghệ bán dẫn", "khoa học dữ liệu", "công nghệ thông tin",
+    "toán tin", "toán học", "vật lý", "vật lí", "hóa học", "sinh học",
+    "khoa học tự nhiên tích hợp stem", "khoa học tự nhiên", "stem",
+    "địa lý", "địa lý học",
+    "lịch sử - địa lý và kinh tế pháp luật", "lịch sử",
+    "văn học",
 ]
 
-TO_HOP_KEYWORDS = [
-    "tổ hợp", "khối thi", "môn thi", "xét tuyển bằng môn",
-    "a00", "a01", "a02", "a03", "a04", "a10",
-    "b00", "b08", "c00", "c01", "d01", "d07",
-]
 
-
-def get_category_filter(query: str) -> tuple[dict, str]:
+def detect_intent(query: str) -> str:
     q = query.lower()
-    if any(kw in q for kw in NHA_TRO_KEYWORDS):
-        return {"category": "nha_tro"}, "nha_tro"
-    return {"category": "tuyen_sinh"}, "tuyen_sinh"
+    to_hop_codes = [m.upper() for m in _TO_HOP_PATTERN.findall(query)]
+
+    # Hỏi toàn bộ ngành
+    if any(p in q for p in ["tất cả ngành", "tất cả các ngành", "danh sách ngành",
+                              "có những ngành", "bao nhiêu ngành", "những ngành nào",
+                              "liệt kê ngành", "các ngành", "toàn bộ ngành"]):
+        return "nganh_list"
+
+    # Hỏi ngược: A00 → ngành nào
+    if to_hop_codes and any(p in q for p in ["ngành nào", "có thể thi", "được học",
+                                               "xét tuyển được", "dùng được", "học được"]):
+        return "nganh_theo_to_hop"
+
+    # Hỏi tổ hợp của ngành, hoặc chỉ hỏi mã tổ hợp gồm môn gì
+    if any(p in q for p in ["tổ hợp", "khối thi", "môn thi", "xét tuyển bằng",
+                              "thi môn", "thi bằng"]) or to_hop_codes:
+        return "to_hop_nganh"
+
+    # Hỏi điểm chuẩn
+    if any(p in q for p in ["điểm chuẩn", "điểm đầu vào", "bao nhiêu điểm", "điểm tối thiểu"]):
+        return "diem_chuan"
+
+    # Hỏi học phí
+    if any(p in q for p in ["học phí", "chi phí học", "phí đào tạo", "đóng tiền", "học bổng"]):
+        return "hoc_phi_hoc_bong"
+
+    # Hỏi ngành chung
+    if any(p in q for p in ["ngành", "khoa", "viện", "chương trình", "chỉ tiêu"]):
+        return "nganh_general"
+
+    return "chinh_sach"
 
 
-def is_to_hop_query(query: str) -> bool:
+def extract_nganh_keywords(query: str) -> list[str]:
+    """Match tên ngành chính xác từ NGANH_LIST — không dùng LLM."""
     q = query.lower()
-    return any(kw in q for kw in TO_HOP_KEYWORDS)
+    found = [n for n in NGANH_LIST if n in q]
+    # Thêm mã ngành nếu có
+    found += _MA_NGANH_PATTERN.findall(query)
+    return list(dict.fromkeys(found))  # dedup giữ thứ tự
 
 
-# ─────────────────────────────────────────────
-# 3. PHÂN LOẠI / ĐỊNH TUYẾN CÂU HỎI (ROUTER)
-# ─────────────────────────────────────────────
-ROUTE_TEMPLATE = """Bạn là bộ phân loại câu hỏi tuyển sinh TNUS.
-Chỉ trả về MỘT từ duy nhất:
-- RAG: Hỏi về ngành học, điểm chuẩn, tổ hợp môn, học phí, nhà trọ, thông tin trường.
-- CHAT: Chào hỏi, cảm ơn, khen ngợi.
-- GENERAL: Các câu hỏi ngoài luồng không liên quan đến trường lớp.
+# ══════════════════════════════════════════════════════════════
+# 4. GRAPH QUERIES — đúng schema thực tế
+#
+# Schema thực tế sau khi step2 chạy:
+#   Structured nodes: NgànhHọc {id, name, ma_nganh}, TổHợpMôn {id, ma, mon_hoc}, KhoaViện {id, name}
+#   LLM nodes: __Entity__ + label riêng, chỉ có property {id}
+#   Relationship hữu ích: DÙNG_TỔ_HỢP, THUỘC_KHOA
+#   Relationship nhiễu (từ LLM transformer): MENTIONS → loại bỏ khỏi output
+# ══════════════════════════════════════════════════════════════
+
+def _safe_query(cypher: str, params: dict = {}) -> list[dict]:
+    """Wrapper query Neo4j, trả về [] nếu lỗi."""
+    try:
+        return graph.query(cypher, params=params) or []
+    except Exception:
+        return []
+
+
+def graph_tat_ca_nganh() -> str:
+    """Lấy toàn bộ danh sách ngành — KHÔNG dùng similarity search."""
+    rows = _safe_query("""
+        MATCH (n:NgànhHọc)
+        OPTIONAL MATCH (n)-[:THUỘC_KHOA]->(k:KhoaViện)
+        RETURN n.name AS name, n.id AS id, n.ma_nganh AS ma, k.name AS khoa
+        ORDER BY n.name
+    """)
+    if not rows:
+        # Fallback: lấy từ __Entity__ nodes nếu structured chưa chạy
+        rows = _safe_query("""
+            MATCH (n:Ngànhhọc)
+            RETURN n.id AS id, null AS name, null AS ma, null AS khoa
+            ORDER BY n.id
+        """)
+    if not rows:
+        return ""
+
+    lines = [f"Danh sách {len(rows)} ngành đào tạo tại TNUS:\n"]
+    current_khoa = None
+    for r in rows:
+        name  = r.get("name") or r.get("id") or "?"
+        ma    = f" (mã: {r['ma']})" if r.get("ma") else ""
+        khoa  = r.get("khoa") or "Chưa phân khoa"
+        if khoa != current_khoa:
+            lines.append(f"\n[{khoa}]")
+            current_khoa = khoa
+        lines.append(f"  • {name}{ma}")
+    return "\n".join(lines)
+
+
+def graph_to_hop_cua_nganh(keywords: list[str], raw_query: str) -> str:
+    """Tổ hợp môn của ngành (hỏi xuôi)."""
+    to_hop_codes = [m.upper() for m in _TO_HOP_PATTERN.findall(raw_query)]
+    lines = []
+
+    # Nếu chỉ hỏi mã tổ hợp gồm môn gì (không nhắc tên ngành)
+    if to_hop_codes and not keywords:
+        for code in to_hop_codes:
+            rows = _safe_query(
+                "MATCH (t:TổHợpMôn {ma: $ma}) RETURN t.ma AS ma, t.mon_hoc AS mon",
+                {"ma": code}
+            )
+            for r in rows:
+                lines.append(f"Tổ hợp {r['ma']}: {r['mon']}")
+        return "\n".join(lines)
+
+    targets = keywords if keywords else [raw_query[:60]]
+    for kw in targets:
+        rows = _safe_query("""
+            MATCH (n:NgànhHọc)-[:DÙNG_TỔ_HỢP]->(t:TổHợpMôn)
+            WHERE toLower(n.name)     CONTAINS toLower($kw)
+               OR toLower(n.id)       CONTAINS toLower($kw)
+               OR toLower(n.ma_nganh) CONTAINS toLower($kw)
+            RETURN n.name AS nganh, n.ma_nganh AS ma_nganh,
+                   collect(t.ma + ': ' + t.mon_hoc) AS to_hop_list
+            ORDER BY n.name
+        """, {"kw": kw})
+        for r in rows:
+            if r["to_hop_list"]:
+                ma = f" ({r['ma_nganh']})" if r.get("ma_nganh") else ""
+                lines.append(f"Ngành {r['nganh']}{ma} xét tuyển bằng:")
+                for th in sorted(r["to_hop_list"]):
+                    lines.append(f"  • {th}")
+    return "\n".join(lines)
+
+
+def graph_nganh_theo_to_hop(raw_query: str) -> str:
+    """Hỏi ngược: tổ hợp A00 → ngành nào."""
+    codes = [m.upper() for m in _TO_HOP_PATTERN.findall(raw_query)]
+    if not codes:
+        return ""
+    lines = []
+    for code in codes:
+        rows = _safe_query("""
+            MATCH (n:NgànhHọc)-[:DÙNG_TỔ_HỢP]->(t:TổHợpMôn {ma: $ma})
+            RETURN t.ma AS to_hop, t.mon_hoc AS mon,
+                   collect(n.name) AS nganh_list
+        """, {"ma": code})
+        for r in rows:
+            nganh_str = ", ".join(sorted(r["nganh_list"]))
+            lines.append(f"Tổ hợp {r['to_hop']} ({r['mon']}) → {len(r['nganh_list'])} ngành: {nganh_str}")
+    return "\n".join(lines)
+
+
+def graph_khoa_cua_nganh(keywords: list[str]) -> str:
+    """Ngành thuộc khoa/viện nào."""
+    lines = []
+    for kw in keywords:
+        rows = _safe_query("""
+            MATCH (n:NgànhHọc)-[:THUỘC_KHOA]->(k:KhoaViện)
+            WHERE toLower(n.name) CONTAINS toLower($kw)
+               OR toLower(n.id)   CONTAINS toLower($kw)
+            RETURN n.name AS nganh, k.name AS khoa
+        """, {"kw": kw})
+        for r in rows:
+            lines.append(f"Ngành {r['nganh']} thuộc {r['khoa']}")
+    return "\n".join(lines)
+
+
+def graph_entity_search(keywords: list[str]) -> str:
+    """
+    Generic search cho học phí, học bổng, điểm chuẩn.
+    Loại bỏ MENTIONS để tránh trả về source file IDs làm nhiễu.
+    """
+    lines = []
+    for kw in keywords:
+        rows = _safe_query("""
+            MATCH (n)-[r]->(m)
+            WHERE type(r) <> 'MENTIONS'
+              AND (
+                  toLower(n.name) CONTAINS toLower($kw)
+               OR toLower(n.id)   CONTAINS toLower($kw)
+              )
+              AND NOT n:Document
+            RETURN coalesce(n.name, n.id) AS source,
+                   type(r)                AS rel,
+                   coalesce(m.name, m.id) AS target
+            LIMIT 12
+        """, {"kw": kw})
+        for r in rows:
+            # Bỏ qua các dòng có source/target trông như file ID (ts-xxx-xxx)
+            src, tgt = r.get("source", ""), r.get("target", "")
+            if src and tgt and not re.match(r'^ts-', str(src)):
+                lines.append(f"{src} —[{r['rel']}]→ {tgt}")
+    return "\n".join(lines)
+
+
+def retrieve_from_graph(query: str, intent: str) -> str:
+    """Điều phối Cypher theo intent."""
+    keywords = extract_nganh_keywords(query)
+
+    if intent == "nganh_list":
+        return graph_tat_ca_nganh()
+
+    if intent == "to_hop_nganh":
+        return graph_to_hop_cua_nganh(keywords, query)
+
+    if intent == "nganh_theo_to_hop":
+        return graph_nganh_theo_to_hop(query)
+
+    if intent == "nganh_general":
+        result = graph_to_hop_cua_nganh(keywords, query)
+        result += "\n" + graph_khoa_cua_nganh(keywords)
+        return result.strip()
+
+    if intent in ("hoc_phi_hoc_bong", "diem_chuan", "chinh_sach"):
+        return graph_entity_search(keywords)
+
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════
+# 5. VECTOR SEARCH
+# ══════════════════════════════════════════════════════════════
+
+def vector_search(query: str, category: str, k: int = 8) -> str:
+    try:
+        docs = vector_store.max_marginal_relevance_search(
+            query, k=k, fetch_k=30, filter={"category": category}
+        )
+        return "\n\n".join(d.page_content for d in docs)
+    except Exception:
+        return ""
+
+
+def vector_search_nha_tro(query: str, k: int = 6) -> str:
+    """
+    Vector search nhà trọ với filter metadata.
+    LƯU Ý: step3 ép bool → str nên co_dieu_hoa lưu là "True"/"False" (string).
+    Filter phải dùng string thay vì bool.
+    """
+    q = query.lower()
+    conditions: list[dict] = [{"category": {"$eq": "nha_tro"}}]
+
+    if any(kw in q for kw in ["điều hòa", "máy lạnh"]):
+        # ChromaDB nhận "True" string vì step3 dùng str(v)
+        conditions.append({"co_dieu_hoa": {"$eq": "True"}})
+    if any(kw in q for kw in ["nóng lạnh", "bình nóng lạnh"]):
+        conditions.append({"co_nong_lanh": {"$eq": "True"}})
+
+    khu_vuc_map = {
+        "phú thái": "Phú Thái", "tân thịnh": "Tân Thịnh",
+        "quyết thắng": "Quyết Thắng", "sơn tiến": "Sơn Tiến",
+        "nước hai": "Nước Hai", "phan đình phùng": "Phan Đình Phùng",
+        "z115": "Z115",
+    }
+    for kw, kv_val in khu_vuc_map.items():
+        if kw in q:
+            conditions.append({"khu_vuc": {"$eq": kv_val}})
+            break
+
+    chroma_filter = {"$and": conditions} if len(conditions) > 1 else {"category": "nha_tro"}
+
+    try:
+        docs = vector_store.max_marginal_relevance_search(
+            query, k=k, fetch_k=20, filter=chroma_filter
+        )
+        # Fallback nếu filter phức tạp không ra kết quả
+        if not docs and chroma_filter != {"category": "nha_tro"}:
+            docs = vector_store.max_marginal_relevance_search(
+                query, k=k, fetch_k=20, filter={"category": "nha_tro"}
+            )
+        return "\n\n".join(d.page_content for d in docs)
+    except Exception:
+        return ""
+
+
+def get_context(query: str, prev_category: str | None = None) -> tuple[str, str, str, str]:
+    """Trả về (vec_ctx, graph_ctx, category, intent)."""
+    category = get_category(query, prev_category)
+
+    if category == "nha_tro":
+        return vector_search_nha_tro(query), "", "nha_tro", "nha_tro"
+
+    intent    = detect_intent(query)
+
+    # Câu hỏi danh sách ngành: query thẳng graph, vector chỉ bổ sung
+    if intent == "nganh_list":
+        graph_ctx = graph_tat_ca_nganh()
+        vec_ctx   = vector_search("giới thiệu ngành đào tạo tnus", "tuyen_sinh", k=3)
+        return vec_ctx, graph_ctx, category, intent
+
+    vec_ctx   = vector_search(query, "tuyen_sinh", k=8)
+    graph_ctx = retrieve_from_graph(query, intent)
+    return vec_ctx, graph_ctx, category, intent
+
+
+# ══════════════════════════════════════════════════════════════
+# 6. ROUTER — phân loại câu hỏi
+# ══════════════════════════════════════════════════════════════
+
+ROUTE_TEMPLATE = """Phân loại câu hỏi sau vào MỘT trong ba nhãn:
+RAG   — hỏi về: ngành học, điểm chuẩn, tổ hợp môn, học phí, học bổng, chỉ tiêu,
+         hồ sơ nhập học, thủ tục, chính sách ưu đãi, nhà trọ, ký túc xá, TNUS.
+CHAT  — chào hỏi thông thường, cảm ơn, hỏi tên bot.
+GENERAL — chủ đề ngoài tuyển sinh/đại học (nấu ăn, thời tiết, giải trí...).
+
+Ví dụ: "TNUS có ngành CNTT không?" → RAG
+        "Tổ hợp A00 gồm những môn gì?" → RAG
+        "Bạn tên là gì?" → CHAT
+        "Python là gì?" → GENERAL
 
 Câu hỏi: {question}
-Phân loại:"""
+Chỉ trả về đúng một từ:"""
 
 route_chain = ChatPromptTemplate.from_template(ROUTE_TEMPLATE) | llm | StrOutputParser()
 
 
 def classify_query(question: str) -> str:
+    q = question.lower()
+    # Fast-path: từ khóa rõ ràng không cần LLM
+    if any(kw in q for kw in _TUYEN_SINH_STRONG | {"tất cả", "danh sách"}):
+        return "RAG"
+    if any(kw in q for kw in _NHA_TRO_STRONG):
+        return "RAG"
     try:
-        res = route_chain.invoke({"question": question}).strip().upper()
-        first_word = res.split()[0] if res else "RAG"
-        return first_word if first_word in ["RAG", "CHAT", "GENERAL"] else "RAG"
+        res   = route_chain.invoke({"question": question}).strip().upper()
+        word  = res.split()[0] if res else "RAG"
+        return word if word in ("RAG", "CHAT", "GENERAL") else "RAG"
     except Exception:
         return "RAG"
 
 
-# ─────────────────────────────────────────────
-# 4. TÓM TẮT LỊCH SỬ HỘI THOẠI
-# ─────────────────────────────────────────────
-SUMMARIZE_TEMPLATE = """Tóm tắt ngắn gọn nhu cầu cốt lõi của người dùng trong hội thoại dưới đây (tối đa 3 câu).
-Hội thoại:\n{conversation}\nTóm tắt:"""
+# ══════════════════════════════════════════════════════════════
+# 7. QUẢN LÝ LỊCH SỬ HỘI THOẠI
+# ══════════════════════════════════════════════════════════════
 
-summarize_chain = ChatPromptTemplate.from_template(SUMMARIZE_TEMPLATE) | llm | StrOutputParser()
-MAX_RAW_HISTORY = 8
-SUMMARIZE_THRESHOLD = 15
+MAX_RAW_HISTORY     = 8
+SUMMARIZE_THRESHOLD = 16
+
+summarize_chain = (
+    ChatPromptTemplate.from_template(
+        "Tóm tắt cuộc hội thoại sau thành 2-3 câu, giữ lại nhu cầu cốt lõi của người dùng.\n"
+        "Hội thoại:\n{conversation}\nTóm tắt:"
+    ) | llm | StrOutputParser()
+)
 
 
 def build_langchain_history(messages: list) -> list:
     history = []
     if st.session_state.get("history_summary"):
-        history.append(AIMessage(content=f"[Bối cảnh cũ: {st.session_state['history_summary']}]"))
+        history.append(AIMessage(
+            content=f"[Tóm tắt trước: {st.session_state['history_summary']}]"
+        ))
     for msg in messages[-MAX_RAW_HISTORY:]:
-        if msg["role"] == "user":
-            history.append(HumanMessage(content=msg["content"]))
-        else:
-            history.append(AIMessage(content=msg["content"]))
+        cls = HumanMessage if msg["role"] == "user" else AIMessage
+        history.append(cls(content=msg["content"]))
     return history
 
 
@@ -128,138 +486,47 @@ def maybe_summarize_history():
     msgs = st.session_state.messages
     if len(msgs) <= SUMMARIZE_THRESHOLD:
         return
-    old_msgs = msgs[:-MAX_RAW_HISTORY]
-    conv_text = "\n".join(f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in old_msgs)
+    old = msgs[:-MAX_RAW_HISTORY]
+    conv = ""
     if st.session_state.get("history_summary"):
-        conv_text = f"[Cũ]: {st.session_state['history_summary']}\n" + conv_text
+        conv = f"[Cũ]: {st.session_state['history_summary']}\n"
+    conv += "\n".join(
+        f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in old
+    )
     try:
-        st.session_state["history_summary"] = summarize_chain.invoke({"conversation": conv_text})
+        st.session_state["history_summary"] = summarize_chain.invoke({"conversation": conv})
         st.session_state.messages = msgs[-MAX_RAW_HISTORY:]
-    except:
+    except Exception:
         pass
 
 
-# ─────────────────────────────────────────────
-# 5. TRUY XUẤT DỮ LIỆU ĐỒ THỊ VÀ VECTOR (FIX SCHEMA LÀM CHUẨN)
-# ─────────────────────────────────────────────
-def vector_search(query: str, cat_filter: dict, k: int = 10) -> list[str]:
-    try:
-        # Giữ nguyên filter category (hoạt động tốt vì dạng chuỗi)
-        docs = vector_store.max_marginal_relevance_search(
-            query, k=k, fetch_k=30, filter=cat_filter
-        )
-        return [doc.page_content for doc in docs]
-    except Exception:
-        return []
+# ══════════════════════════════════════════════════════════════
+# 8. MASTER PROMPT
+# ══════════════════════════════════════════════════════════════
 
+MASTER_SYSTEM = """Bạn là trợ lý AI tuyển sinh của Trường Đại học Khoa học – TNUS năm 2026.
+CHẾ ĐỘ: {route}
 
-def extract_keywords(query: str) -> list[str]:
-    prompt = ChatPromptTemplate.from_template(
-        "Trích xuất 2 cụm danh từ cốt lõi nhất từ câu hỏi để tìm kiếm chính xác thực thể. "
-        "Chỉ trả về từ khóa cách nhau bằng dấu phẩy, không giải thích gì thêm.\nCâu hỏi: {query}"
-    )
-    try:
-        response = (prompt | llm | StrOutputParser()).invoke({"query": query})
-        return [kw.strip() for kw in response.split(",") if kw.strip() and len(kw.strip()) >= 3]
-    except Exception:
-        return []
+━━━ CHẾ ĐỘ RAG ━━━
+NGUYÊN TẮC BẮT BUỘC:
+1. CHỈ dùng thông tin từ DỮ LIỆU GRAPH và DỮ LIỆU VECTOR bên dưới. TUYỆT ĐỐI không thêm tên ngành, điểm số, tổ hợp, học phí từ kiến thức bản thân.
+2. Nếu DỮ LIỆU GRAPH có danh sách ngành/tổ hợp → trình bày ĐÚNG NGUYÊN nội dung đó, không thêm không bớt.
+3. Nếu cả hai nguồn đều trống → trả lời: "Mình chưa tìm thấy thông tin này. Bạn liên hệ fanpage TNUS để được hỗ trợ nhé!"
+4. Phong cách: thân thiện, xưng "mình", gọi là "bạn". Dùng Markdown gọn gàng.
+5. Cuối câu trả lời: gợi ý 1 câu hỏi tiếp theo liên quan.
+6. Nhà trọ: thêm cảnh báo "⚠️ Giá thuê có thể thay đổi — liên hệ chủ trọ để xác nhận."
 
-
-def retrieve_from_graph(query: str, keywords: list[str], category: str) -> list[str]:
-    if category == "nha_tro":
-        return []
-
-    graph_context = []
-    q_lower = query.lower()
-
-    # FIX 2: Đồng bộ Node Label 'Ngànhhọc' viết thường không dấu cách và dùng thuộc tính n.id
-    if "tất cả" in q_lower and "ngành" in q_lower:
-        cypher_all = "MATCH (n:Ngànhhọc) RETURN n.id AS nganh ORDER BY n.id"
-        try:
-            res = graph.query(cypher_all)
-            if res:
-                danh_sach = [r['nganh'] for r in res]
-                graph_context.append("Danh sách toàn bộ các ngành đào tạo tại TNUS:\n- " + "\n- ".join(danh_sach))
-        except:
-            pass
-
-    # FIX 3: Luồng lấy tổ hợp môn chuẩn hóa theo mối quan hệ [DÙNG_TỔ_HỢP] và label viết thường
-    if is_to_hop_query(query):
-        for kw in keywords:
-            cypher_tohop = """
-            MATCH (n:Ngànhhọc)-[:DÙNG_TỔ_HỢP]->(t:Tổhợpmôn)
-            WHERE toLower(n.id) CONTAINS toLower($keyword)
-            RETURN n.id AS nganh, t.ma AS ma_to_hop, t.mon_hoc AS mon_hoc
-            ORDER BY t.ma
-            """
-            try:
-                results = graph.query(cypher_tohop, params={"keyword": kw})
-                if results:
-                    nganh_name = results[0]["nganh"]
-                    graph_context.append(f"Ngành {nganh_name} xét tuyển các tổ hợp:")
-                    for r in results:
-                        graph_context.append(f"  + {r['ma_to_hop']}: {r['mon_hoc']}")
-            except:
-                pass
-        if graph_context:
-            return list(set(graph_context))
-
-    # FIX 4: Quét Tổng quát giới hạn theo Label chuẩn hóa, triệt tiêu nhiễu [MENTIONS], chỉ bốc thuộc tính id
-    if keywords:
-        for kw in keywords:
-            cypher_general = """
-            MATCH (n)-[r]->(m)
-            WHERE (n:Ngànhhọc OR n:Khoaviện OR n:Tổhợpmôn)
-              AND toLower(n.id) CONTAINS toLower($keyword)
-            RETURN n.id AS source, type(r) AS rel, m.id AS target
-            LIMIT 10
-            """
-            try:
-                for res in graph.query(cypher_general, params={"keyword": kw}):
-                    graph_context.append(f"{res['source']} -> {res['rel']} -> {res['target']}")
-            except:
-                pass
-
-    return list(set(graph_context))
-
-
-def get_context(query: str) -> tuple[str, str, str]:
-    cat_filter, category = get_category_filter(query)
-
-    k_val = 10 if category == "tuyen_sinh" else 8
-    docs = vector_search(query, cat_filter, k=k_val)
-    vector_context = "\n\n".join(docs)
-
-    graph_context = "Không có dữ liệu đồ thị."
-    if category == "tuyen_sinh":
-        keywords = extract_keywords(query)
-        graph_data = retrieve_from_graph(query, keywords, category)
-        if graph_data:
-            graph_context = "\n".join(graph_data)
-
-    return vector_context, graph_context, category
-
-
-# ─────────────────────────────────────────────
-# 6. GỘP PROMPT & MASTER CHAIN
-# ─────────────────────────────────────────────
-MASTER_SYSTEM = """Bạn là trợ lý AI tuyển sinh đại học trực thuộc Trường Đại học Khoa học - ĐH Thái Nguyên (TNUS) năm 2026.
-CHẾ ĐỘ XỬ LÝ: [{route}]
-
-QUY TẮC CỐT LÕI (CHẾ ĐỘ RAG):
-1. Bạn phải dựa hoàn toàn vào DỮ LIỆU ĐỒ THỊ và DỮ LIỆU VECTOR được cung cấp dưới đây để trả lời câu hỏi. Không được tự suy diễn thông tin nằm ngoài tài liệu.
-2. Đối với các dữ liệu đồ thị, tên thực thể hiển thị chính là mã hoặc định danh của thực thể đó. Hãy trình bày tường minh, dễ hiểu cho học sinh THPT.
-3. Luôn giữ thái độ cởi mở, thân thiện, xưng "mình" và gọi người học là "bạn" hoặc "em".
-
---- DỮ LIỆU TỪ HỆ THỐNG GRAPH (Mối quan hệ chính xác) ---
+--- DỮ LIỆU GRAPH (cấu trúc, độ chính xác cao) ---
 {graph_context}
 
---- DỮ LIỆU TỪ HỆ THỐNG VECTOR (Văn bản chi tiết) ---
+--- DỮ LIỆU VECTOR (mô tả chi tiết) ---
 {vector_context}
 
-NẾU CHẾ ĐỘ LÀ [CHAT] / [GENERAL]:
-- CHAT: Phản hồi ấm áp, định hướng quay lại tìm hiểu tuyển sinh TNUS.
-- GENERAL: Đáp ngắn gọn (dưới 2 câu) rồi khéo léo từ chối để tập trung nhiệm vụ tuyển sinh.
+━━━ CHẾ ĐỘ CHAT ━━━
+Trò chuyện tự nhiên, giới thiệu ngắn về TNUS nếu phù hợp.
+
+━━━ CHẾ ĐỘ GENERAL ━━━
+Trả lời ngắn gọn (tối đa 2 câu), sau đó nhắc lại nhiệm vụ chính là tư vấn tuyển sinh TNUS.
 """
 
 master_prompt = ChatPromptTemplate.from_messages([
@@ -269,17 +536,25 @@ master_prompt = ChatPromptTemplate.from_messages([
 ])
 master_chain = master_prompt | llm | StrOutputParser()
 
-# ─────────────────────────────────────────────
-# 7. GIAO DIỆN STREAMLIT
-# ─────────────────────────────────────────────
-st.set_page_config(page_title="Tư vấn tuyển sinh TNUS", page_icon="tnus_logo.png", layout="centered")
 
+# ══════════════════════════════════════════════════════════════
+# 9. GIAO DIỆN STREAMLIT
+# ══════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title="Tư vấn tuyển sinh TNUS",
+    page_icon="tnus_logo.png",
+    layout="centered",
+)
+
+# ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
-    # --- THÊM LOGO VÀO SIDEBAR ---
-    st.image("tnus_logo.png", use_container_width=True)
-
+    try:
+        st.image("tnus_logo.png", width=120)
+    except Exception:
+        pass
     st.markdown("### Tư vấn tuyển sinh TNUS 2026")
-    st.caption("Đại học Khoa học - ĐH Thái Nguyên")
+    st.caption("Trường Đại học Khoa học – ĐH Thái Nguyên")
     st.divider()
 
     col1, col2 = st.columns(2)
@@ -287,6 +562,7 @@ with st.sidebar:
         if st.button("🗑️ Xóa chat", use_container_width=True):
             st.session_state.messages = []
             st.session_state.pop("history_summary", None)
+            st.session_state.pop("last_category", None)
             st.rerun()
     with col2:
         if st.button("📋 Tóm tắt", use_container_width=True):
@@ -295,79 +571,99 @@ with st.sidebar:
     st.divider()
     msg_count = len(st.session_state.get("messages", []))
     user_msgs = sum(1 for m in st.session_state.get("messages", []) if m["role"] == "user")
-    st.caption(f"📊 Tổng tin nhắn: **{msg_count}** | Câu hỏi: **{user_msgs}**")
+    st.caption(f"📊 Tin nhắn: **{msg_count}** | Câu hỏi: **{user_msgs}**")
 
     if st.session_state.get("history_summary"):
         with st.expander("📝 Tóm tắt lịch sử"):
             st.info(st.session_state["history_summary"])
 
-    st.divider()
-    if st.button("📊 Xem thống kê", use_container_width=True):
-        st.session_state["show_analytics"] = True
+    if _HAS_LOGGER:
+        st.divider()
+        if st.button("📊 Thống kê", use_container_width=True):
+            st.session_state["show_analytics"] = True
 
-# --- THÊM LOGO BÊN CẠNH TIÊU ĐỀ CHÍNH ---
-col_logo, col_title = st.columns([1, 6])
+# ── Header ───────────────────────────────────────────────────
+col_logo, col_title = st.columns([1, 5])
 with col_logo:
-    st.image("tnus_logo.png", use_container_width=True)
+    try:
+        st.image("tnus_logo.png", width=60)
+    except Exception:
+        pass
 with col_title:
     st.title("Tư vấn tuyển sinh TNUS")
+st.markdown("*Hỏi về ngành học, điểm chuẩn, tổ hợp môn, học phí, học bổng hoặc nhà trọ!*")
 
-st.markdown("*Hỏi về ngành học, điểm chuẩn, khối xét tuyển, hoặc thông tin nhà trọ sinh viên!*")
+# ── Session state ─────────────────────────────────────────────
+for key, default in [("messages", []), ("history_summary", ""), ("last_category", None)]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ── Tin nhắn chào mừng ────────────────────────────────────────
+if not st.session_state.messages:
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": (
+            "Xin chào! 👋 Mình là **trợ lý tuyển sinh TNUS** — sẵn sàng hỗ trợ bạn!\n\n"
+            "Mình có thể giúp về:\n"
+            "- 📚 **Ngành học** — 40 chương trình, tổ hợp môn, điểm chuẩn\n"
+            "- 💰 **Học phí & học bổng** năm 2026\n"
+            "- 📝 **Hồ sơ, thủ tục nhập học**\n"
+            "- 🏠 **Nhà trọ** gần trường\n\n"
+            "Bạn muốn tìm hiểu về điều gì? 😊"
+        ),
+        "route": "CHAT",
+    })
 
-if len(st.session_state.messages) == 0:
-    welcome_msg = (
-        "Xin chào! 👋 Mình là **trợ lý tuyển sinh đại học TNUS 2026**.\n\n"
-        "Sẵn sàng hỗ trợ bạn tra cứu điểm chuẩn, tổ hợp xét tuyển môn và các khu nhà trọ quanh trường.\n"
-        "Bạn cần mình hỗ trợ thông tin gì hôm nay?"
-    )
-    st.session_state.messages.append({"role": "assistant", "content": welcome_msg, "route": "CHAT"})
+# ── Hiển thị lịch sử ─────────────────────────────────────────
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg["role"] == "assistant" and msg.get("route") not in (None, "CHAT"):
+            badge = {"RAG": "📚 Dữ liệu cục bộ", "GENERAL": "🌐 Kiến thức nền"}
+            st.caption(f"*Nguồn: {badge.get(msg['route'], '')}*")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if message["role"] == "assistant" and message.get("route") not in (None, "CHAT"):
-            ROUTE_BADGE = {"RAG": "📚 Dữ liệu Đại học", "GENERAL": "🌐 Kiến thức nền"}
-            st.caption(f"*Nguồn: {ROUTE_BADGE.get(message['route'], '')}*")
-
+# ── Tóm tắt nhanh ────────────────────────────────────────────
 if st.session_state.get("show_summary"):
     st.session_state.pop("show_summary")
     if len(st.session_state.messages) > 2:
         with st.spinner("Đang tóm tắt..."):
             conv = "\n".join(
-                f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}" for m in st.session_state.messages)
+                f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}"
+                for m in st.session_state.messages
+            )
             try:
-                summary = summarize_chain.invoke({"conversation": conv})
-                st.info(f"**📋 Tóm tắt hội thoại:**\n\n{summary}")
-            except:
-                st.warning("Lỗi trích xuất tóm tắt.")
+                st.info(f"**📋 Tóm tắt:**\n\n{summarize_chain.invoke({'conversation': conv})}")
+            except Exception:
+                st.warning("Không thể tóm tắt lúc này.")
     else:
-        st.info("Hội thoại chưa đủ độ dài.")
+        st.info("Hội thoại chưa đủ để tóm tắt.")
 
-if st.session_state.get("show_analytics"):
+# ── Analytics ────────────────────────────────────────────────
+if _HAS_LOGGER and st.session_state.get("show_analytics"):
     st.session_state.pop("show_analytics")
-    try:
-        from step6_analytics_logger import get_logs
+    logs = get_logs(limit=500)
+    if not logs:
+        st.info("Chưa có dữ liệu log.")
+    else:
         import pandas as pd
+        df = pd.DataFrame(logs)
+        st.markdown("### 📊 Thống kê hội thoại")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Tổng câu hỏi", len(df))
+        if "route" in df.columns:
+            c2.metric("RAG queries", int((df["route"] == "RAG").sum()))
+        st.dataframe(df.head(50), use_container_width=True)
 
-        logs = get_logs(limit=50)
-        if logs:
-            st.dataframe(pd.DataFrame(logs))
-        else:
-            st.info("Chưa ghi nhận logs.")
-    except:
-        st.warning("Không thể đọc cấu trúc log.")
 
-# ─────────────────────────────────────────────
-# 8. XỬ LÝ DÒNG DỮ LIỆU VÀO
-# ─────────────────────────────────────────────
-user_query = st.chat_input("Nhập câu hỏi tại đây...")
+# ══════════════════════════════════════════════════════════════
+# 10. XỬ LÝ ĐẦU VÀO
+# ══════════════════════════════════════════════════════════════
+
+user_query = st.chat_input("Hỏi về ngành học, điểm chuẩn, tổ hợp môn, nhà trọ...")
 
 if user_query:
     maybe_summarize_history()
-    st.session_state.messages.append({"role": "user", "content": user_query, "route": None})
+    st.session_state.messages.append({"role": "user", "content": user_query})
 
     with st.chat_message("user"):
         st.markdown(user_query)
@@ -375,40 +671,44 @@ if user_query:
     history_for_llm = build_langchain_history(st.session_state.messages[:-1])
 
     with st.chat_message("assistant"):
-        with st.spinner("Đang tra cứu dữ liệu hệ thống..."):
+        with st.spinner("Đang tìm kiếm..."):
             route = classify_query(user_query)
 
             if route == "RAG":
-                vec_ctx, graph_ctx, category = get_context(user_query)
+                prev_cat = st.session_state.get("last_category")
+                vec_ctx, graph_ctx, category, intent = get_context(user_query, prev_cat)
+                st.session_state["last_category"] = category
             else:
-                vec_ctx, graph_ctx, category = "", "Không có dữ liệu đồ thị.", "khac"
+                vec_ctx, graph_ctx, category, intent = "", "", "khac", "khac"
 
-            ROUTE_LABEL = {"RAG": "📚 Dữ liệu nội bộ", "CHAT": "💬 Giao tiếp", "GENERAL": "🌐 Kiến thức chung"}
+            graph_ctx_prompt = graph_ctx or "Không có dữ liệu đồ thị cho câu hỏi này."
+            vec_ctx_prompt   = vec_ctx   or "Không tìm thấy văn bản liên quan."
+
+            badge = {"RAG": "📚 Dữ liệu cục bộ", "CHAT": "💬 Hội thoại", "GENERAL": "🌐 Kiến thức nền"}
             if route != "CHAT":
-                st.caption(f"*Nguồn: {ROUTE_LABEL.get(route, 'Khác')}*")
+                st.caption(f"*Nguồn: {badge.get(route, '')}*")
 
-            response_stream = master_chain.stream({
-                "route": route,
-                "vector_context": vec_ctx,
-                "graph_context": graph_ctx,
-                "chat_history": history_for_llm,
-                "question": user_query,
-            })
+        response = st.write_stream(master_chain.stream({
+            "route":          route,
+            "graph_context":  graph_ctx_prompt,
+            "vector_context": vec_ctx_prompt,
+            "chat_history":   history_for_llm,
+            "question":       user_query,
+        }))
 
-            response = st.write_stream(response_stream)
-
-            if route == "RAG":
-                with st.expander("🛠️ Debug Hệ thống — Context Trích xuất"):
-                    st.markdown(f"**Từ khóa:** `{extract_keywords(user_query)}` | **Mục:** `{category}`")
-                    st.markdown("**🕸️ Neo4j Graph Data:**")
-                    st.success(graph_ctx if graph_ctx else "Trống")
-                    st.markdown("**📄 ChromaDB Vector Data:**")
-                    st.info(vec_ctx[:600] + "..." if len(vec_ctx) > 600 else vec_ctx or "Trống")
+        # Debug expander
+        if route == "RAG":
+            with st.expander("🛠️ Debug"):
+                kws = extract_nganh_keywords(user_query)
+                codes = [m.upper() for m in _TO_HOP_PATTERN.findall(user_query)]
+                st.markdown(
+                    f"**Category:** `{category}` | **Intent:** `{intent}`\n\n"
+                    f"**Keywords ngành:** `{kws}` | **Mã tổ hợp:** `{codes}`"
+                )
+                st.markdown("**🕸️ Graph:**")
+                st.success(graph_ctx or "(trống)")
+                st.markdown("**📄 Vector (600 ký tự đầu):**")
+                st.info(vec_ctx[:600] + "..." if len(vec_ctx) > 600 else vec_ctx or "(trống)")
 
     st.session_state.messages.append({"role": "assistant", "content": response, "route": route})
-
-    try:
-        log_cat = category if route == "RAG" else "khac"
-        log_interaction(route, log_cat, user_query, response)
-    except:
-        pass
+    log_interaction(route, category, user_query, response)
